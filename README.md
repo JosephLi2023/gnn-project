@@ -8,3 +8,5 @@ Paper https://doi.org/10.1145/2827872
 
 ReDial: https://redialdata.github.io/website/ 	
 paper https://arxiv.org/pdf/1812.07617
+
+Ollama Docs: https://docs.ollama.com/quickstart#python
