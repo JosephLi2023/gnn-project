@@ -5,7 +5,7 @@ import re
 import pickle
 from sentence_transformers import SentenceTransformer
 
-class TextFeaturePipeline:
+class InspiredFeaturePipeline:
     """
     A class to handle the full pipeline from raw text to an aligned
     feature matrix for the GNN.
