@@ -4,6 +4,8 @@ from torch_geometric.data import HeteroData
 from sentence_transformers import SentenceTransformer
 import os
 import numpy as np
+import torch.nn.functional as F
+from scipy.sparse import csr_matrix
 
 class MovieLensProcessor:
     def __init__(self, data_dir='ml-32m/'):
@@ -27,12 +29,48 @@ class MovieLensProcessor:
 
         movie_tags.to_parquet(os.path.join('processed_data', 'movie_tags_embeddings.parquet'))
 
-
+    def initialize_user_embeddings(self, high_ratings, movie_embeddings, user_to_idx, movie_id_to_idx):
+        """
+        Initialize users as weighted average of movies they rated highly
+        """
+        n_users = len(user_to_idx)
+        n_movies = movie_embeddings.shape[0]
+        embedding_dim = movie_embeddings.shape[1]
+        
+        # Create sparse user-movie rating matrix
+        user_indices = high_ratings['user_idx'].values
+        movie_indices = high_ratings['movie_idx'].values
+        ratings = high_ratings['rating'].values
+        
+        # Normalize ratings per user (for weighted average)
+        user_rating_sums = high_ratings.groupby('user_idx')['rating'].sum()
+        normalized_ratings = ratings / user_rating_sums.loc[user_indices].values
+        
+        # Create sparse matrix: users x movies (with normalized ratings as values)
+        rating_matrix = csr_matrix(
+            (normalized_ratings, (user_indices, movie_indices)),
+            shape=(n_users, n_movies)
+        )
+        
+        # Matrix multiplication: (n_users x n_movies) @ (n_movies x embedding_dim)
+        # This computes weighted average in one operation!
+        user_embeddings = rating_matrix @ movie_embeddings
+        
+        # Convert to torch
+        user_embeddings = torch.tensor(user_embeddings, dtype=torch.float)
+        
+        # Normalize to match scale of movie embeddings
+        movie_emb_tensor = torch.tensor(movie_embeddings, dtype=torch.float)
+        user_embeddings = F.normalize(user_embeddings, p=2, dim=1) * movie_emb_tensor.norm(dim=1).mean()
+        
+        print(f"User embeddings shape: {user_embeddings.shape}")
+        return user_embeddings
+    
     def process(self):
         movies = pd.read_csv(f'{self.data_dir}/movies.csv')
 
         ## add tag embeddings to movies df       
-        movie_tags = pd.read_parquet(os.path.join(self.data_dir, 'movie_tags_embeddings.parquet')) 
+        movie_tags = pd.read_parquet(os.path.join('processed_data', 'movie_tags_embeddings.parquet')) 
         movies = movies.merge(
             movie_tags[['movieId', 'tag_embedding']], 
             on='movieId', 
@@ -101,8 +139,12 @@ class MovieLensProcessor:
         # User nodes
         data['user'].num_nodes = len(user_to_idx)
         data['user'].user_id = torch.tensor(list(user_to_idx.keys()), dtype=torch.long)
-        embedding_dim = movie_embeddings.shape[1]  # 384
-        data['user'].x = torch.zeros(len(user_to_idx), embedding_dim)
+        data['user'].x = self.initialize_user_embeddings(
+            high_ratings, 
+            movie_embeddings, 
+            user_to_idx, 
+            movie_id_to_idx
+        )
         
         # Genre nodes
         data['genre'].num_nodes = len(genre_to_idx)
