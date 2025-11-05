@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, HeteroConv
 from transformers import BertTokenizer, BertModel
+from torch_geometric.nn import GATv2Conv
 
 # --- GAT Encoder with configurable layers ---
 class GATEncoder(nn.Module):
@@ -11,6 +12,8 @@ class GATEncoder(nn.Module):
         self.layers = nn.ModuleList()
         self.num_layers = num_layers
         self.dropout = dropout
+        self.residual = True
+        self.norms = nn.ModuleDict({node_type: nn.BatchNorm1d(hidden_dim) for node_type in ['user','movie','genre','conversation']})
         for i in range(num_layers):
             if i == 0:
                 in_channels = (-1,-1) # lazy init helps with heterogenous graphs
@@ -30,27 +33,27 @@ class GATEncoder(nn.Module):
 
             layer = HeteroConv({
                 ('movie', 'has_genre', 'genre'): 
-                    GATConv(in_channels, out_channels, heads=heads, concat=concat, 
+                    GATv2Conv(in_channels, out_channels, heads=heads, concat=concat, 
                            dropout=dropout, add_self_loops=False),
                             ('genre', 'has_movie', 'movie'): 
-                    GATConv(in_channels, out_channels, heads=heads, concat=concat,
+                    GATv2Conv(in_channels, out_channels, heads=heads, concat=concat,
                            dropout=dropout, add_self_loops=False),
                             ('user', 'rated_high', 'movie'):
-                    GATConv(in_channels, out_channels, heads=heads, concat=concat,
+                    GATv2Conv(in_channels, out_channels, heads=heads, concat=concat,
                            dropout=dropout, add_self_loops=False),
                             ('movie', 'rated_by', 'user'):
-                    GATConv(in_channels, out_channels, heads=heads, concat=concat,
+                    GATv2Conv(in_channels, out_channels, heads=heads, concat=concat,
                            dropout=dropout, add_self_loops=False),
                             ('conversation', 'mentions', 'movie'): 
-                    GATConv(in_channels, out_channels, heads=heads, concat=concat,
+                    GATv2Conv(in_channels, out_channels, heads=heads, concat=concat,
                            dropout=dropout, add_self_loops=False),
                             ('movie', 'mentioned_in', 'conversation'):
-                    GATConv(in_channels, out_channels, heads=heads, concat=concat,
+                    GATv2Conv(in_channels, out_channels, heads=heads, concat=concat,
                            dropout=dropout, add_self_loops=False)
             }, aggr='sum')
             self.layers.append(layer)
 
-    def forward(self, x_dict, edge_index_dict):
+    def forward(self, x_dict, edge_index_dict, monitor_attention=False):
         """
         Args:
             x_dict: Dict[node_type, Tensor[num_nodes, feat_dim]]
@@ -58,15 +61,31 @@ class GATEncoder(nn.Module):
         Returns:
             x_dict: Dict[node_type, Tensor[num_nodes, out_dim]]
         """
+        attention_stats={}
         for i, layer in enumerate(self.layers):
-            x_dict = layer(x_dict, edge_index_dict)
+            prev_x_dict = x_dict
+            if monitor_attention:
+                attn_weights_dict = {}
+                out_dict = {}
+                for edge_type, conv in layer.convs.items():
+                    out,(edge_index,attn_weights) = conv(x_dict[edge_type[0]],edge_index_dict[edge_type], return_attention_weights=True)
+                    out_dict[edge_type[2]] = out
+                    attn_weights_dict[edge_type] = attn_weights.detach().cpu()
+                x_dict = out_dict
+                attention_stats[f'layer_{i}'] = attn_weights_dict
+            else:
+                x_dict = layer(x_dict, edge_index_dict)
             
             # Apply activation and dropout (except last layer)
             if i != self.num_layers - 1:
                 x_dict = {key: F.relu(x) for key, x in x_dict.items()}
+                x_dict = {key: self.norms[key](x) for key, x in x_dict.items()}
                 x_dict = {key: F.dropout(x, p=self.dropout, training=self.training) 
                          for key, x in x_dict.items()}
-        
+                if self.residual:
+                    x_dict = {key: x + prev_x_dict[key] for key in x_dict}
+        if monitor_attention:
+            return x_dict, attention_stats
         return x_dict
 
 

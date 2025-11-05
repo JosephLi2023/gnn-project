@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import os
 from tqdm import tqdm
-
+from torch_geometric.transforms import DropEdge
 
 class LinkPredictionPretrainer:
     """
@@ -71,7 +71,10 @@ class LinkPredictionPretrainer:
         """
         Memory-efficient pretraining step with batched processing
         """
-        z_dict = self.encoder(data.x_dict, data.edge_index_dict)
+        z_dicti,attention_stats = self.encoder(data.x_dict, data.edge_index_dict, monitor_attention=True)
+        for layer_name, attn_dict in attention_stats.items():
+            for edge_type, attn_weights in attn_dict.items():
+                print(f"{layer_name} {edge_type}: mean={attn-weights.mean():.4f}, std={attn_weights.std():.4f}, min={attn_weights.min():.4f},max={attn-weights.max():.4f}")
         
         losses = {}
         metrics = {}
@@ -205,13 +208,16 @@ def pretrain_link_prediction(encoder, data, epochs=15, lr=5e-4,
     
     best_loss = float('inf')
     
+    # Drop edges
+    drop_edge = DropEdge(p=0.2)
     for epoch in range(epochs):
         # Clear cache at start of epoch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
+        dropped_data = drop_edge(data)
         # Forward pass
-        total_loss, metrics = pretrainer.pretrain_step(data)
+        total_loss, metrics = pretrainer.pretrain_step(dropped_data)
         
         # Scale loss for gradient accumulation
         scaled_loss = total_loss / accumulation_steps
