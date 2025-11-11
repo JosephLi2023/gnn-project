@@ -1,13 +1,15 @@
 import torch
 import torch_geometric
 from utils.utils import load_graph
-from models.models import GATEncoder
+from models.encoder import GATEncoder
 import inspect
 import _operator
 import typing
 import torch.nn.functional as F
 import numpy
-
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import numpy as np
 
 def check_embedding_quality(encoder, data, device='cuda'):
     """
@@ -60,11 +62,99 @@ def check_embedding_quality(encoder, data, device='cuda'):
     encoder.train()
     print("="*60 + "\n")
 
-# Run after training:
-
+def visualize_movie_embeddings_multi_genre(encoder, data, top_n_genres=6, sample_size=2000, device='cuda'):
+    """
+    Create multiple TSNE plots, one highlighting each major genre
+    """
+    encoder.to(device)
+    data = data.to(device)
+    encoder.eval()
     
-    # You would then call this in your main validation function
-    # after you calculate `movie_embs = F.normalize(...)`
+    with torch.no_grad():
+        z_dict = encoder(data.x_dict, data.edge_index_dict)
+        movie_emb = z_dict['movie']
+        
+        n_movies = movie_emb.shape[0]
+        movie_genre_edges = data['movie', 'has_genre', 'genre'].edge_index
+        
+        # Get genre names from node attributes
+        genre_names = data['genre'].genre_name  # This should be a list or tensor
+        print(f"Total genres in graph: {len(genre_names)}")
+        
+        # Sample if needed
+        if n_movies > sample_size:
+            sample_idx = torch.randperm(n_movies)[:sample_size].sort()[0]
+            tsne_emb = movie_emb[sample_idx].cpu().numpy()
+        else:
+            sample_idx = torch.arange(n_movies)
+            tsne_emb = movie_emb.cpu().numpy()
+            sample_size = n_movies
+        
+        # Build movie -> genres mapping (multi-label)
+        from collections import defaultdict
+        movie_to_genres = defaultdict(list)
+        sample_idx_set = set(sample_idx.cpu().numpy())
+        
+        for movie_idx, genre_idx in zip(movie_genre_edges[0].cpu().numpy(), 
+                                        movie_genre_edges[1].cpu().numpy()):
+            if movie_idx in sample_idx_set:
+                movie_to_genres[movie_idx].append(genre_idx)
+        
+        # Count genre frequencies to find top genres
+        genre_counts = defaultdict(int)
+        for genres in movie_to_genres.values():
+            for g in genres:
+                genre_counts[g] += 1
+        
+        top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:top_n_genres]
+        print(f"\nTop {top_n_genres} genres by frequency:")
+        for genre_idx, count in top_genres:
+            # Get the actual genre name
+            genre_name = genre_names[genre_idx]
+            print(f"  {genre_name}: {count} movies")
+        
+        # Run TSNE once
+        perplexity = min(30, max(5, sample_size // 3 - 1))
+        print(f"\nRunning TSNE with perplexity={perplexity}...")
+        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, verbose=1)
+        X_tsne = tsne.fit_transform(tsne_emb)
+        
+        # Create subplots
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        axes = axes.flatten()
+        
+        for idx, (genre_idx, count) in enumerate(top_genres):
+            ax = axes[idx]
+            
+            # Get genre name
+            genre_name = genre_names[genre_idx]
+            
+            # Create mask for this genre
+            has_genre = np.array([genre_idx in movie_to_genres.get(m.item(), []) 
+                                  for m in sample_idx])
+            
+            # Plot background (movies without this genre)
+            ax.scatter(X_tsne[~has_genre, 0], X_tsne[~has_genre, 1], 
+                      s=5, alpha=0.2, c='lightgray', edgecolors='none')
+            
+            # Highlight movies with this genre
+            ax.scatter(X_tsne[has_genre, 0], X_tsne[has_genre, 1], 
+                      s=15, alpha=0.7, c='red', edgecolors='none')
+            
+            ax.set_title(f'{genre_name}\n({count} movies, {count/sample_size*100:.1f}%)', 
+                        fontsize=11, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.set_xlabel('TSNE-1')
+            ax.set_ylabel('TSNE-2')
+        
+        plt.suptitle(f'Movie Embeddings by Genre\n({sample_size} movies)', 
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig('tsne_movie_embeddings_multi_genre.png', dpi=200, bbox_inches='tight')
+        plt.close()
+    
+    encoder.train()
+
 if __name__ == '__main__':
     torch.serialization.add_safe_globals([GATEncoder,#FIXME: there has to be a way around this
                                           torch.nn.modules.container.ModuleList,
@@ -87,7 +177,7 @@ if __name__ == '__main__':
                                           numpy.dtypes.Float64DType])
     
     encoder = GATEncoder()
-    encoder.parameters = torch.load('checkpoints/best_anti_collapse.pt', weights_only=True)
+    encoder.parameters = torch.load('checkpoints/best_pretrained_encoder.pt', weights_only=True)
     data = load_graph(name='combined_graph_filtered')
     # Check current movie embeddings
     movie_embs = data['movie'].x
@@ -103,8 +193,9 @@ if __name__ == '__main__':
     print(f"Movie embedding similarity: {mean_sim:.3f}")
 
     if mean_sim > 0.7:
-        print('too similar!')
+        print('too similar')
     else:
         print('good diversity')
     
     check_embedding_quality(encoder, data)
+    visualize_movie_embeddings_multi_genre(encoder, data, top_n_genres=6, sample_size=2000)

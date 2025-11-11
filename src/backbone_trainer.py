@@ -163,7 +163,7 @@ class LinkPredictionPretrainer:
 def pretrain_link_prediction(encoder, data, epochs=15, lr=5e-4, 
                              warmup_epochs=3, device='cuda',
                              checkpoint_dir='checkpoints',
-                             batch_size=4096,
+                             batch_size=2048,
                              accumulation_steps=1):
     """
     Memory-efficient pretraining
@@ -317,7 +317,7 @@ def plot_training_history(history, save_path='pretrain_history.png'):
 
 if __name__ == "__main__":
     from utils.utils import load_graph
-    from models.models import GATEncoder
+    from models.encoder import GATEncoder
     
     # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -326,6 +326,7 @@ if __name__ == "__main__":
     # Load data
     print("Loading graph...")
     data = load_graph(name='combined_graph_filtered').to(device)
+    print(data)
     print("✓ Graph loaded\n")
     
     # Initialize encoder

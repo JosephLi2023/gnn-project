@@ -1,0 +1,32 @@
+============================================================
+Embedding Quality Diagnostics
+============================================================
+
+genre:
+  Variance: 0.0000
+  Norm: 0.435 ± 0.008
+  Pairwise similarity: 0.985 ± 0.012
+variance too small
+very high similarity
+
+movie:
+  Variance: 0.0001
+  Norm: 0.913 ± 0.063 
+  Pairwise similarity: 0.944 ± 0.095
+variance too small
+very high similarity
+
+user:
+  Variance: 0.0000 
+  Norm: 0.430 ± 0.004 
+  Pairwise similarity: 0.998 ± 0.002
+variance too small
+very high similarity
+
+conversation:
+  Variance: 0.0002
+  Norm: 0.645 ± 0.030
+  Pairwise similarity: 0.804 ± 0.051
+variance too small
+very high similarity
+============================================================

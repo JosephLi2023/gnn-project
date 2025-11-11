@@ -6,7 +6,7 @@ from utils import load_graph
 def filter_combined_graph(ratings_path='processed_data/high_ratings.parquet',
                          top_k_movies=5000,
                          top_k_users=2000,
-                         output_path='processed_data/combined_graph_filtered.pt'):
+                         graph_name='combined_graph'):
     """
     Filter the combined graph to keep only:
     1. Top K movies by rating count
@@ -14,7 +14,7 @@ def filter_combined_graph(ratings_path='processed_data/high_ratings.parquet',
     3. All users, genres, and conversations connected to these movies
     """
     print("Loading combined graph...")
-    data = load_graph(name='combined_graph')
+    data = load_graph(name=graph_name)
     
     print("Loading ratings data...")
     high_ratings = pd.read_parquet(ratings_path)
@@ -57,7 +57,7 @@ def filter_combined_graph(ratings_path='processed_data/high_ratings.parquet',
     filtered_data['movie'].movie_id = data['movie'].movie_id[old_movie_mask]
     filtered_data['movie'].movie_name = [data['movie'].movie_name[i] for i in movies_to_keep_list]
     
-    # Filter movie-genre edges
+    #Filter movie-genre edges
     print("Filtering movie-genre edges...")
     movie_genre_edges = data['movie', 'has_genre', 'genre'].edge_index
     mask = torch.tensor([idx.item() in movies_to_keep for idx in movie_genre_edges[0]])
@@ -105,18 +105,18 @@ def filter_combined_graph(ratings_path='processed_data/high_ratings.parquet',
     new_movie_indices = torch.tensor([old_to_new_movie_idx[idx] for idx in high_ratings_filtered['movie_idx'].values])
     
     filtered_data['user', 'rated_high', 'movie'].edge_index = torch.stack([new_user_indices, new_movie_indices])
-    filtered_data['user', 'rated_high', 'movie'].edge_attr = torch.tensor(
-        high_ratings_filtered['rating'].values, 
-        dtype=torch.float
-    ).unsqueeze(1)
+    # filtered_data['user', 'rated_high', 'movie'].edge_attr = torch.tensor(
+    #     high_ratings_filtered['rating'].values, 
+    #     dtype=torch.float
+    # ).unsqueeze(1)
     
     # Filter movie-user edges (reverse)
     print("Filtering movie-user edges...")
     filtered_data['movie', 'rated_by', 'user'].edge_index = torch.stack([new_movie_indices, new_user_indices])
-    filtered_data['movie', 'rated_by', 'user'].edge_attr = torch.tensor(
-        high_ratings_filtered['rating'].values, 
-        dtype=torch.float
-    ).unsqueeze(1)
+    # filtered_data['movie', 'rated_by', 'user'].edge_attr = torch.tensor(
+    #     high_ratings_filtered['rating'].values, 
+    #     dtype=torch.float
+    # ).unsqueeze(1)
     
     # Filter user nodes
     print("Filtering user nodes...")
@@ -169,12 +169,12 @@ def filter_combined_graph(ratings_path='processed_data/high_ratings.parquet',
     print(f"Original conversations: {data['conversation'].num_nodes} -> Filtered: {filtered_data['conversation'].num_nodes}")
     
     # Save
-    print(f"\nSaving to {output_path}...")
-    torch.save(filtered_data, output_path)
+    print(f"\nSaving to processed_data/{graph_name}_filtered...")
+    torch.save(filtered_data, f"processed_data/{graph_name}_filtered.pt")
     print("Done!")
     
     return filtered_data
 
 
 if __name__ == "__main__":
-    filtered_graph = filter_combined_graph()
+    filtered_graph = filter_combined_graph(graph_name='combined_graph')
