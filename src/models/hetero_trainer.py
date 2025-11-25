@@ -6,12 +6,36 @@ from hetero_encoder import HeteroGNN
 # Load the data
 data = torch.load("acm.pkl")
 # Create HeteroData object
-hetero_data = HeteroData()
-hetero_data['paper'].x = data['feature']
-hetero_data['paper'].y = data['label']
-# Add edge indices for each message type
-hetero_data['paper', 'author', 'paper'].edge_index = data['pap']
-hetero_data['paper', 'subject', 'paper'].edge_index = data['psp']
+hetero_graph = HeteroData()
+# Node features (example shapes)
+num_conversations = 10000
+conv_feat_dim = 64
+num_users = 10000
+user_feat_dim = 64
+num_movies = 10000
+movie_feat_dim = 64
+num_genres = 100
+genre_feat_dim = 64
+hetero_graph['conversation'].x = torch.randn(num_conversations, conv_feat_dim)
+hetero_graph['user'].x = torch.randn(num_users, user_feat_dim)
+hetero_graph['movie'].x = torch.randn(num_movies, movie_feat_dim)
+hetero_graph['genre'].x = torch.randn(num_genres, genre_feat_dim)
+# Edge indices and attributes
+hetero_graph['conversation', 'mentions', 'movie'].edge_index = conv_movie_edge_index
+hetero_graph['conversation', 'mentions', 'movie'].edge_attr = conv_movie_edge_attr  # shape [num_edges, 6]
+hetero_graph['movie', 'mentioned_in', 'conversation'].edge_index = movie_conv_edge_index
+hetero_graph['movie', 'mentioned_in', 'conversation'].edge_attr = conv_movie_edge_attr  # shape [num_edges, 6]
+hetero_graph['user', 'rated_high', 'movie'].edge_index = user_movie_edges
+hetero_graph['user', 'rated_high', 'movie'].edge_attr = torch.tensor(
+    high_ratings['rating'].values, dtype=torch.float
+).unsqueeze(1)  # shape [num_edges, 1]
+hetero_graph['movie', 'rated_by', 'user'].edge_index = movie_user_edges
+hetero_graph['movie', 'rated_by', 'user'].edge_attr = torch.tensor(
+    high_ratings['rating'].values, dtype=torch.float
+).unsqueeze(1)  # shape [num_edges, 1]
+hetero_graph['movie', 'has_genre', 'genre'].edge_index = movie_genre_edges
+hetero_graph['genre', 'has_movie', 'movie'].edge_index = genre_movie_edges
+
 # Move to device
 device = args['device']
 hetero_data = hetero_data.to(device)
@@ -23,7 +47,7 @@ test_edge_index = data['test_edge_index'].to(device)
 def train(model, optimizer, data, train_edge_index, neg_edge_sampler):
     model.train()
     optimizer.zero_grad()
-    z_dict = model(data.x_dict, data.edge_index_dict)
+    z_dict = model(data.x_dict, data.edge_index_dict, data.edge_attr_dict)
     # Positive samples
     pos_src = train_edge_index[0]
     pos_dst = train_edge_index[1]
@@ -33,8 +57,8 @@ def train(model, optimizer, data, train_edge_index, neg_edge_sampler):
     neg_src = neg_edge_index[0]
     neg_dst = neg_edge_index[1]
     # Compute scores
-    src_emb = z_dict['paper']
-    dst_emb = z_dict['paper']
+    src_emb = z_dict['user']
+    dst_emb = z_dict['movie']
     pos_score = (src_emb[pos_src] * dst_emb[pos_dst]).sum(dim=1)
     neg_score = (src_emb[neg_src] * dst_emb[neg_dst]).sum(dim=1)
     # Link prediction loss
@@ -46,9 +70,9 @@ def train(model, optimizer, data, train_edge_index, neg_edge_sampler):
 @torch.no_grad()
 def test(model, data, edge_index, neg_edge_sampler):
     model.eval()
-    z_dict = model(data.x_dict, data.edge_index_dict)
-    src_emb = z_dict['paper']
-    dst_emb = z_dict['paper']
+    z_dict = model(data.x_dict, data.edge_index_dict, data.edge_attr_dict)
+    src_emb = z_dict['user']
+    dst_emb = z_dict['movie']
     pos_src = edge_index[0]
     pos_dst = edge_index[1]
     num_neg = pos_src.size(0)
@@ -64,9 +88,8 @@ def test(model, data, edge_index, neg_edge_sampler):
     return auc
 
 def neg_edge_sampler(data, num_neg):
-    # For link prediction, sample negatives for ('paper', 'author', 'paper') edge type
-    edge_index = data['paper', 'author', 'paper'].edge_index
-    num_nodes = data['paper'].num_nodes
+    edge_index = data['user', 'rated_high', 'movie'].edge_index
+    num_nodes = data['user'].num_nodes
     neg_edge_index = negative_sampling(
         edge_index=edge_index,
         num_nodes=num_nodes,
@@ -76,7 +99,20 @@ def neg_edge_sampler(data, num_neg):
     return neg_edge_index
 
 metadata = (list(hetero_data.node_types), list(hetero_data.edge_types))
-model = HeteroGNN(metadata, in_channels_dict, hidden_dim=64, num_layers=2, use_attention=False).to(device)
+edge_attr_dims = {
+    ('conversation', 'mentions', 'movie'): 1,
+    ('movie', 'mentioned_in', 'conversation'): 1,
+    ('user', 'rated_high', 'movie'): 1,
+    ('movie', 'rated_by', 'user'): 1,
+    # No entry for edges without attributes
+}
+model = HeteroGNN(
+    metadata=metadata,
+    x_dict={nt: hetero_graph[nt].x for nt in hetero_graph.node_types},
+    args={'hidden_size': 64, 'attn_size': 32},
+    edge_attr_dims=edge_attr_dims,
+    aggr="mean"
+).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=args['lr'], weight_decay=args['weight_decay'])
 best_auc = 0
 best_model = None
