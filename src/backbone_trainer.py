@@ -1,357 +1,301 @@
-
 import torch
 import torch.nn.functional as F
-import os
-from tqdm import tqdm
-from torch_geometric.transforms import DropEdge
-
-class LinkPredictionPretrainer:
-    """
-    Simple link prediction pretraining across all edge types
-    """
-    def __init__(self, encoder, device='cuda', batch_size = 4096):
-        self.encoder = encoder
-        self.device = device
-        self.batch_size = batch_size
-    
-    def negative_sampling_safe(self, pos_edge_index, num_src_nodes, num_dst_nodes, num_neg_samples=None):
-        """
-        Safe negative sampling that handles bipartite graphs
-        """
-        if num_neg_samples is None:
-            num_neg_samples = pos_edge_index.shape[1]
-        
-        # Sample random negative edges
-        neg_src = torch.randint(0, num_src_nodes, (num_neg_samples,), device=self.device)
-        neg_dst = torch.randint(0, num_dst_nodes, (num_neg_samples,), device=self.device)
-        neg_edge_index = torch.stack([neg_src, neg_dst], dim=0)
-        
-        return neg_edge_index
-    
-    def link_prediction_loss_batched(self, src_emb, dst_emb, pos_edge_index, neg_edge_index, batch_size):
-        """
-        Batched link prediction loss to save memory
-        """
-        num_edges = pos_edge_index.shape[1]
-        total_loss = 0
-        total_pos_score = 0
-        total_neg_score = 0
-        num_batches = 0
-        
-        for start_idx in range(0, num_edges, batch_size):
-            end_idx = min(start_idx + batch_size, num_edges)
-            
-            # Batch positive edges
-            batch_pos_idx = pos_edge_index[:, start_idx:end_idx]
-            pos_src = src_emb[batch_pos_idx[0]]
-            pos_dst = dst_emb[batch_pos_idx[1]]
-            pos_scores = (pos_src * pos_dst).sum(dim=1)
-            
-            # Batch negative edges
-            batch_neg_idx = neg_edge_index[:, start_idx:end_idx]
-            neg_src = src_emb[batch_neg_idx[0]]
-            neg_dst = dst_emb[batch_neg_idx[1]]
-            neg_scores = (neg_src * neg_dst).sum(dim=1)
-            
-            # BPR loss
-            batch_loss = -F.logsigmoid(pos_scores - neg_scores).mean()
-            
-            total_loss += batch_loss
-            total_pos_score += pos_scores.mean().item()
-            total_neg_score += neg_scores.mean().item()
-            num_batches += 1
-        
-        avg_loss = total_loss / num_batches
-        avg_pos = total_pos_score / num_batches
-        avg_neg = total_neg_score / num_batches
-        
-        return avg_loss, avg_pos, avg_neg
-    
-    def pretrain_step(self, data):
-        """
-        Memory-efficient pretraining step with batched processing
-        """
-        z_dicti,attention_stats = self.encoder(data.x_dict, data.edge_index_dict, monitor_attention=True)
-        for layer_name, attn_dict in attention_stats.items():
-            for edge_type, attn_weights in attn_dict.items():
-                print(f"{layer_name} {edge_type}: mean={attn-weights.mean():.4f}, std={attn_weights.std():.4f}, min={attn_weights.min():.4f},max={attn-weights.max():.4f}")
-        
-        losses = {}
-        metrics = {}
-        
-        # 1. User-Movie edges (60% weight)
-        if ('user', 'rated_high', 'movie') in data.edge_types:
-            pos_edges = data['user', 'rated_high', 'movie'].edge_index
-            
-            num_pos = pos_edges.shape[1]
-            num_neg = min(num_pos, 100000)  # Cap at 100k negatives
-            
-            neg_edges = self.negative_sampling_safe(
-                pos_edges,
-                data['user'].num_nodes,
-                data['movie'].num_nodes,
-                num_neg_samples=num_neg
-            )
-            
-            # Use subset of positive edges if too many
-            if num_pos > 100000:
-                perm = torch.randperm(num_pos, device=self.device)[:100000]
-                pos_edges = pos_edges[:, perm]
-            
-            loss, pos_score, neg_score = self.link_prediction_loss_batched(
-                z_dict['user'], z_dict['movie'],
-                pos_edges, neg_edges,
-                batch_size=self.batch_size
-            )
-            losses['user_movie'] = loss
-            metrics['user_movie_pos'] = pos_score
-            metrics['user_movie_neg'] = neg_score
-        
-        # 2. Movie-Genre edges (30% weight)
-        if ('movie', 'has_genre', 'genre') in data.edge_types:
-            pos_edges = data['movie', 'has_genre', 'genre'].edge_index
-            neg_edges = self.negative_sampling_safe(
-                pos_edges,
-                data['movie'].num_nodes,
-                data['genre'].num_nodes,
-                num_neg_samples=pos_edges.shape[1]
-            )
-            
-            loss, pos_score, neg_score = self.link_prediction_loss_batched(
-                z_dict['movie'], z_dict['genre'],
-                pos_edges, neg_edges,
-                batch_size=self.batch_size
-            )
-            losses['movie_genre'] = loss
-            metrics['movie_genre_pos'] = pos_score
-            metrics['movie_genre_neg'] = neg_score
-        
-        # 3. Conversation-Movie edges (10% weight)
-        if ('conversation', 'mentions', 'movie') in data.edge_types:
-            pos_edges = data['conversation', 'mentions', 'movie'].edge_index
-            
-            if pos_edges.shape[1] > 0:
-                neg_edges = self.negative_sampling_safe(
-                    pos_edges,
-                    data['conversation'].num_nodes,
-                    data['movie'].num_nodes,
-                    num_neg_samples=pos_edges.shape[1]
-                )
-                
-                loss, pos_score, neg_score = self.link_prediction_loss_batched(
-                    z_dict['conversation'], z_dict['movie'],
-                    pos_edges, neg_edges,
-                    batch_size=self.batch_size
-                )
-                losses['conv_movie'] = loss
-                metrics['conv_movie_pos'] = pos_score
-                metrics['conv_movie_neg'] = neg_score
-        
-        # Weighted combination
-        weights = {
-            'user_movie': 0.6,
-            'movie_genre': 0.3,
-            'conv_movie': 0.1
-        }
-        
-        total_loss = sum(weights.get(k, 0) * v for k, v in losses.items())
-        
-        # Add individual losses to metrics
-        for k, v in losses.items():
-            metrics[f'{k}_loss'] = v.item()
-        
-        return total_loss, metrics
+from torch_geometric.transforms import RandomLinkSplit
+import gc
 
 
-def pretrain_link_prediction(encoder, data, epochs=15, lr=5e-4, 
-                             warmup_epochs=3, device='cuda',
-                             checkpoint_dir='checkpoints',
-                             batch_size=4096,
-                             accumulation_steps=1):
-    """
-    Memory-efficient pretraining
-    """
-    
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Initialize with batch size
-    pretrainer = LinkPredictionPretrainer(encoder, device=device, batch_size=batch_size)
-    
-    # Use more aggressive memory settings
-    optimizer = torch.optim.AdamW(
-        encoder.parameters(),
-        lr=lr,
-        weight_decay=1e-4,
-        betas=(0.9, 0.999)
-    )
-    
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
+def clear_cuda_memory():
+    """Clear CUDA memory cache and run garbage collection."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+
+
+def split_edges(data, val_split=0.1, test_split=0.1, neg_sampling_ratio=1.0):
+
+    # Get all edge types from the graph
+    all_edge_types = list(data.edge_types)
+    edge_type_set = set(all_edge_types)
+    processed = set()
+
+    # Split edge types into forward and reverse pairs
+    edge_types = []  # Will contain one edge from each pair (e.g., 'user rates movie')
+    rev_edge_types = []  # Will contain corresponding reverse edges
+
+    for edge_type in all_edge_types:
+        if edge_type in processed:
+            continue
+
+        src, rel, dst = edge_type
+
+        # Check if there's a reverse edge with flipped source and destination types
+        reverse_edge = None
+        for other_edge_type in edge_type_set:
+            other_src, other_rel, other_dst = other_edge_type
+
+            # If source and destination are flipped, it's a reverse edge
+            if src == other_dst and dst == other_src and edge_type != other_edge_type:
+                reverse_edge = other_edge_type
+                break
+
+        if reverse_edge:
+            # Found a bidirectional pair
+            edge_types.append(edge_type)
+            rev_edge_types.append((edge_type, reverse_edge))
+            processed.add(edge_type)
+            processed.add(reverse_edge)
         else:
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    history = {
-        'total_loss': [],
-        'user_movie_loss': [],
-        'movie_genre_loss': [],
-        'conv_movie_loss': [],
-        'lr': []
-    }
-    
-    # Training loop
-    print(f"\n=== Training ===")
+            # No reverse edge found, just add as a regular edge
+            edge_types.append(edge_type)
+
+    transform = RandomLinkSplit(
+        num_val=val_split,
+        num_test=test_split,
+        is_undirected=False,
+        edge_types=edge_types,
+        rev_edge_types=rev_edge_types if rev_edge_types else None,
+        neg_sampling_ratio=neg_sampling_ratio,  # Auto-generate negative samples
+        add_negative_train_samples=True,
+    )
+
+    # Apply transform - returns 3 data objects
+    train_data, val_data, test_data = transform(data)
+    return train_data, val_data, test_data
+
+
+def compute_loss(z_src, z_dst, edge_label_index, edge_label, margin=1.0, num_neg_samples=5):
+    # Compute dot product scores for all edges (positive + negative)
+    src_emb = z_src[edge_label_index[0]]
+    dst_emb = z_dst[edge_label_index[1]]
+    scores = (src_emb * dst_emb).sum(dim=1)
+
+    # Split into positive and negative samples
+    pos_mask = edge_label == 1
+    neg_mask = edge_label == 0
+
+    pos_scores = scores[pos_mask]
+    neg_scores = scores[neg_mask]
+
+    # Handle edge cases
+    if pos_scores.numel() == 0 or neg_scores.numel() == 0:
+        # Fallback to BCE if we don't have both positive and negative samples
+        return F.binary_cross_entropy_with_logits(scores, edge_label.float())
+
+    # Memory-efficient: sample K negatives per positive instead of all pairs
+    num_pos = pos_scores.size(0)
+    num_neg = neg_scores.size(0)
+
+    # Sample negative indices for each positive (with replacement if needed)
+    K = min(num_neg_samples, num_neg)
+    neg_indices = torch.randint(0, num_neg, (num_pos, K), device=pos_scores.device)
+
+    # Get sampled negative scores [num_pos, K]
+    sampled_neg_scores = neg_scores[neg_indices]
+
+    # Compute BPR loss: -log(sigmoid(pos - neg - margin))
+    pos_expanded = pos_scores.unsqueeze(1)  # [num_pos, 1]
+    diff = pos_expanded - sampled_neg_scores - margin  # [num_pos, K]
+
+    loss = -F.logsigmoid(diff).mean()
+
+    return loss
+
+
+def train_epoch(encoder, data, margin=1.0):
     encoder.train()
-    
-    best_loss = float('inf')
-    
-    # Drop edges
-    drop_edge = DropEdge(p=0.2)
+    z = encoder(data.x_dict, data.edge_index_dict)
+
+    total_loss = 0
+    num_edge_types = 0
+
+    # Iterate over edge types that have supervision labels
+    for edge_type in data.edge_label_index_dict.keys():
+        edge_label_index = data.edge_label_index_dict[edge_type]
+        edge_label = data.edge_label_dict[edge_type]
+
+        if edge_label_index.shape[1] == 0:
+            continue
+
+        src_type, _, dst_type = edge_type
+
+        loss = compute_loss(
+            z[src_type],
+            z[dst_type],
+            edge_label_index,
+            edge_label,
+            margin=margin
+        )
+        total_loss += loss
+        num_edge_types += 1
+
+    # Average loss across edge types
+    if num_edge_types > 0:
+        total_loss = total_loss / num_edge_types
+
+    return total_loss
+
+
+def eval_epoch(encoder, data, margin=1.0):
+    """Single evaluation epoch"""
+    encoder.eval()
+    with torch.no_grad():
+        return train_epoch(encoder, data, margin=margin)
+
+
+def pretrain(encoder, data, epochs=50, lr=1e-3, patience=10, neg_sampling_ratio=1.0, margin=1.0, file_name='best_encoder.pt'):
+
+    # Split edges using PyG's RandomLinkSplit
+    train_data, val_data, test_data = split_edges(data, neg_sampling_ratio=neg_sampling_ratio)
+
+    # Setup training
+    optimizer = torch.optim.Adam(encoder.parameters(), lr=lr)
+    best_val_loss = float('inf')
+    patience_counter = 0
+
+    # Training loop
     for epoch in range(epochs):
-        # Clear cache at start of epoch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        dropped_data = drop_edge(data)
-        # Forward pass
-        total_loss, metrics = pretrainer.pretrain_step(dropped_data)
-        
-        # Scale loss for gradient accumulation
-        scaled_loss = total_loss / accumulation_steps
-        
-        # Backward pass
-        scaled_loss.backward()
-        
-        # Update weights every accumulation_steps
-        if (epoch + 1) % accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-        
-        # Record history
-        history['total_loss'].append(total_loss.item())
-        history['lr'].append(optimizer.param_groups[0]['lr'])
-        for k, v in metrics.items():
-            if k.endswith('_loss'):
-                if k not in history:
-                    history[k] = []
-                history[k].append(v)
-        
-        # Logging
-        if epoch % 5 == 0 or epoch == epochs - 1:
-            log_str = f"Epoch {epoch:2d}/{epochs}: Loss={total_loss:.4f}, LR={optimizer.param_groups[0]['lr']:.6f}"
-            
-            if torch.cuda.is_available():
-                log_str += f", GPU={torch.cuda.memory_allocated() / 1e9:.2f}GB"
-            
-            if 'user_movie_loss' in metrics:
-                log_str += f"\n  User-Movie: loss={metrics['user_movie_loss']:.4f}, pos={metrics['user_movie_pos']:.3f}, neg={metrics['user_movie_neg']:.3f}"
-            if 'movie_genre_loss' in metrics:
-                log_str += f"\n  Movie-Genre: loss={metrics['movie_genre_loss']:.4f}, pos={metrics['movie_genre_pos']:.3f}, neg={metrics['movie_genre_neg']:.3f}"
-            if 'conv_movie_loss' in metrics:
-                log_str += f"\n  Conv-Movie: loss={metrics['conv_movie_loss']:.4f}, pos={metrics['conv_movie_pos']:.3f}, neg={metrics['conv_movie_neg']:.3f}"
-            
-            print(log_str)
-        
-        # Save best checkpoint
-        if total_loss.item() < best_loss:
-            best_loss = total_loss.item()
-            checkpoint_path = os.path.join(checkpoint_dir, 'best_pretrained_encoder.pt')
-            torch.save({
-                'epoch': epoch,
-                'encoder_state_dict': encoder.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_loss,
-                'history': history
-            }, checkpoint_path)
-    
-    # Save final checkpoint
-    final_path = os.path.join(checkpoint_dir, 'final_pretrained_encoder.pt')
-    torch.save({
-        'epoch': epochs,
-        'encoder_state_dict': encoder.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': total_loss.item(),
-        'history': history
-    }, final_path)
-    
-    print(f"\n{'='*70}")
-    print(f"Best loss: {best_loss:.4f}")
-    print(f"Saved checkpoints:")
-    print(f"  - Best: {checkpoint_path}")
-    print(f"  - Final: {final_path}")
-    print(f"{'='*70}\n")
-    
-    return encoder, history
+        # Train
+        train_loss = train_epoch(encoder, train_data, margin=margin)
+        optimizer.zero_grad()
+        train_loss.backward()
+        optimizer.step()
 
+        # Validate
+        val_loss = eval_epoch(encoder, val_data, margin=margin)
 
-def plot_training_history(history, save_path='pretrain_history.png'):
-    """
-    Plot training curves
-    """
-    import matplotlib.pyplot as plt
-    
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    
-    # Total loss
-    axes[0].plot(history['total_loss'], label='Total Loss')
-    axes[0].set_xlabel('Epoch')
-    axes[0].set_ylabel('Loss')
-    axes[0].set_title('Pretraining Loss')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-    
-    # Individual losses
-    for key in history.keys():
-        if key.endswith('_loss') and key != 'total_loss':
-            axes[1].plot(history[key], label=key.replace('_loss', ''))
-    axes[1].set_xlabel('Epoch')
-    axes[1].set_ylabel('Loss')
-    axes[1].set_title('Individual Task Losses')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    print(f"Saved training plot to {save_path}")
-    plt.close()
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(encoder.state_dict(), file_name)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch:3d}/{epochs}: Train={train_loss:.4f}, Val={val_loss:.4f}")
+
+    # Test
+    print("\n=== Final Test Evaluation ===")
+    encoder.load_state_dict(torch.load(file_name, weights_only=True))
+    test_loss = eval_epoch(encoder, test_data, margin=margin)
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Best Val Loss: {best_val_loss:.4f}\n")
+
+    return encoder
 
 
 if __name__ == "__main__":
     from utils.utils import load_graph
-    from models.models import GATEncoder
-    
-    # Setup
+    from models.hetero_encoder import HeteroGNN
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
-    
-    # Load data
-    print("Loading graph...")
+
     data = load_graph(name='combined_graph_filtered').to(device)
-    print("✓ Graph loaded\n")
-    
-    # Initialize encoder
-    print("Initializing encoder...")
-    encoder = GATEncoder(num_layers=2).to(device)
-    
-    # Pretrain
-    encoder, history = pretrain_link_prediction(
-        encoder=encoder,
-        data=data,
-        epochs=15,
-        lr=5e-4,
-        warmup_epochs=3,
-        device=device,
-        checkpoint_dir='checkpoints'
-    )
-    
-    # Plot results
+
+    # # Define args for HeteroGNN
+    # args = {
+    #     'hidden_size': 128,  # Adjust as needed
+    #     'attn_size': 32      # Only used if aggr='attn'
+    # }
+    print(' starting suite of heterogeneous GNN encoders...\n')
+
+    # HGT
     try:
-        plot_training_history(history)
-    except ImportError:
-        print("Matplotlib not available, skipping plot")
+        print("=== Training HGTEncoder ===")
+        clear_cuda_memory()
+
+        from premade_hetero_models import HGTEncoder
+        encoder = HGTEncoder(
+            metadata=data.metadata(),
+            x_dict=data.x_dict,
+            hidden_size=128,
+            num_layers=2,
+            num_heads=4
+        ).to(device)
+        pretrain(encoder, data, epochs=100, lr=5e-4, patience=15, neg_sampling_ratio=1.0, margin=1.0, file_name='best_hgt_encoder.pt')
+
+        # Clean up after training
+        del encoder
+        clear_cuda_memory()
+        print("HGTEncoder training complete. Memory cleared.\n")
+    except Exception as e:
+        print(f"HGTEncoder failed to run: {e}. Skipping...")
+        clear_cuda_memory()
     
+    #R-GCN
+    try:
+        print("=== Training RGCNEncoder ===")
+        clear_cuda_memory()
+
+        from premade_hetero_models import RGCNEncoder
+        encoder = RGCNEncoder(
+            metadata=data.metadata(),
+            x_dict=data.x_dict,
+            hidden_size=128,
+            num_layers=2,
+            num_bases=10  # Adjust based on number of edge types
+        ).to(device)
+        pretrain(encoder, data, epochs=100, lr=5e-4, patience=15, neg_sampling_ratio=1.0, margin=1.0, file_name='best_rgcn_encoder.pt')
+
+        # Clean up after training
+        del encoder
+        clear_cuda_memory()
+        print("RGCNEncoder training complete. Memory cleared.\n")
+    except Exception as e:
+        print(f"RGCNEncoder failed to run: {e}. Skipping...")
+        clear_cuda_memory()
+
+    
+
+    # HAN
+    try:
+        print("=== Training HANEncoder ===")
+        clear_cuda_memory()
+
+        from premade_hetero_models import HANEncoder
+        encoder = HANEncoder(
+            metadata=data.metadata(),
+            x_dict=data.x_dict,
+            hidden_size=128,
+            num_layers=2,
+            num_heads=4
+        ).to(device)
+
+        pretrain(encoder, data, epochs=100, lr=5e-4, patience=15, neg_sampling_ratio=1.0, margin=1.0, file_name='best_han_encoder.pt')
+
+        # Clean up after training
+        del encoder
+        clear_cuda_memory()
+        print("HANEncoder training complete. Memory cleared.\n")
+    except Exception as e:
+        print(f"HANEncoder failed to run: {e}. Skipping...")
+        clear_cuda_memory()
+    
+
+    # HeteroSAGE
+    try:
+        print("=== Training HeteroSAGEEncoder ===")
+        clear_cuda_memory()
+
+        from premade_hetero_models import HeteroSAGEEncoder
+        encoder = HeteroSAGEEncoder(
+            metadata=data.metadata(),
+            x_dict=data.x_dict,
+            hidden_size=128,
+            num_layers=2
+        ).to(device)
+
+        pretrain(encoder, data, epochs=100, lr=5e-4, patience=15, neg_sampling_ratio=1.0, margin=1.0, file_name='best_sage_encoder.pt')
+
+        # Clean up after training
+        del encoder
+        clear_cuda_memory()
+        print("HeteroSAGEEncoder training complete. Memory cleared.\n")
+    except Exception as e:
+        print(f"HeteroSAGEEncoder failed to run: {e}. Skipping...")
+        clear_cuda_memory()
