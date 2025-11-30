@@ -1,19 +1,31 @@
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
-class QueryGuidedPooling(nn.Module):
-    def __init__(self, node_dim, query_dim, hidden_dim=128):
-        super().__init__()
-        self.node_proj = nn.Linear(node_dim, hidden_dim)
-        self.query_proj = nn.Linear(query_dim, hidden_dim)
-        self.attn = nn.Linear(hidden_dim, 1)
-        self.dropout = nn.Dropout(0.3)
-    
-    def forward(self, node_embs, query_emb, batch=None):
-        # node_embs: [N, node_dim], query_emb: [B, query_dim]
-        node_proj = self.node_proj(node_embs)  # [N, H]
-        query_proj = self.query_proj(query_emb)  # [B, H]
-        attn_scores = self.attn(torch.tanh(node_proj.unsqueeze(0) + query_proj.unsqueeze(1))).squeeze(-1)
-        attn_weights = torch.softmax(attn_scores, dim=1)
-        pooled = torch.sum(attn_weights.unsqueeze(-1) * node_embs.unsqueeze(0), dim=1)
-        return self.dropout(pooled)
+def query_guided_pooling(movie_embs, query_emb):
+    """
+    Query-guided pooling using attention mechanism.
+    Args:
+        movie_embs (torch.Tensor): [num_movies_in_subgraph, emb_dim]
+        query_emb (torch.Tensor): [emb_dim] or [1, emb_dim]
+    Returns:
+        pooled_emb (torch.Tensor): [emb_dim]
+    """
+    # Ensure query_emb is [1, emb_dim]
+    if query_emb.dim() == 1:
+        query_emb = query_emb.unsqueeze(0)
+    # Compute attention scores (dot product)
+    attn_scores = torch.matmul(movie_embs, query_emb.T).squeeze(-1)  # [num_movies_in_subgraph]
+    attn_weights = F.softmax(attn_scores, dim=0)  # [num_movies_in_subgraph]
+    # Weighted sum of movie embeddings
+    pooled_emb = torch.sum(movie_embs * attn_weights.unsqueeze(-1), dim=0)  # [emb_dim]
+    return pooled_emb
+
+def pool_subgraph(subgraph, node_type='movie', method='qgp', query_emb=None):
+    movie_embs = subgraph[node_type].x  # [num_movies_in_subgraph, emb_dim]
+    if method == 'qgp':
+        assert query_emb is not None, "Query embedding required for query-guided pooling"
+        return query_guided_pooling(movie_embs, query_emb)
+    elif method == 'mean':
+        return movie_embs.mean(dim=0)
+    elif method == 'max':
+        return movie_embs.max(dim=0)[0]

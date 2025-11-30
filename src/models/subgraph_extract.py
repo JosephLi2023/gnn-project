@@ -1,12 +1,23 @@
-from torch_geometric.utils import from_networkx
+import torch
+from collections import deque
 
-def subgraph_to_pyg(nx_subgraph, node_feat_dim):
-    if nx_subgraph.number_of_edges() == 0:
-        return None
-    for n in nx_subgraph.nodes:
-        emb = nx_subgraph.nodes[n].get('embedding', np.zeros(node_feat_dim))
-        nx_subgraph.nodes[n]['x'] = torch.tensor(emb, dtype=torch.float)
-    data = from_networkx(nx_subgraph, node_attrs=['x'], edge_attrs=['weight', 'type'])
-    data.edge_weight = data.weight
-    data.edge_type = data.type
-    return data
+def extract_subgraph(data, candidate_movie_ids, query_emb, similarity_threshold=0.6, max_depth=2):
+    visited = set(candidate_movie_ids)
+    queue = deque([(node_id, 0) for node_id in candidate_movie_ids])
+    movie_embs = data['movie'].x
+    while queue:
+        node_id, depth = queue.popleft()
+        if depth >= max_depth:
+            continue
+        neighbors = get_neighbors(data, node_id)
+        for neighbor_id in neighbors:
+            if neighbor_id in visited:
+                continue
+            if neighbor_id in range(movie_embs.shape[0]):
+                neighbor_emb = movie_embs[neighbor_id]
+                sim = torch.dot(neighbor_emb, query_emb) / (neighbor_emb.norm() * query_emb.norm() + 1e-8)
+                if sim > similarity_threshold:
+                    visited.add(neighbor_id)
+                    queue.append((neighbor_id, depth + 1))
+    subgraph = data.subgraph(list(visited))
+    return subgraph
