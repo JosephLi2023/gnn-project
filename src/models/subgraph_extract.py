@@ -1,6 +1,11 @@
 import torch
 from collections import deque
 
+def get_neighbors(data, node_id):
+    # Implement this for your HeteroData structure
+    # Should return a list of neighbor node IDs for the given movie node
+    raise NotImplementedError
+    
 def extract_subgraph(data, candidate_movie_ids, query_emb, similarity_threshold=0.6, max_depth=2):
     visited = set(candidate_movie_ids)
     queue = deque([(node_id, 0) for node_id in candidate_movie_ids])
