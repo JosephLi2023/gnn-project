@@ -46,7 +46,7 @@ class HeteroSAGEEncoder(nn.Module):
         return x_dict
 
 class FusionScorer(nn.Module):
-  def __init__(self, emb_dim, query_dim, fusion_dim=[512, 256, 128, 32, 1]):
+  def __init__(self, emb_dim=128, query_dim=384, fusion_dim=[256, 128, 64, 1]):
     super().__init__()
 
     self.query_proj = nn.Linear(query_dim, emb_dim)
@@ -61,20 +61,26 @@ class FusionScorer(nn.Module):
         nn.Linear(fusion_dim[1], fusion_dim[2]),
         nn.ReLU(),
 
-        nn.Linear(fusion_dim[2], fusion_dim[3]),
-        nn.ReLU(),
-        
-        nn.Linear(fusion_dim[3], fusion_dim[4])
+        nn.Linear(fusion_dim[2], fusion_dim[3]),        
     )
 
-  def forward(self, movie_emb, query_emb):
-    query_proj = self.query_proj(query_emb)
-    x = torch.cat((movie_emb, query_proj), dim=1)
-    x = self.net(x)
-    return x.squeeze(-1)
+  def forward(self, neighbor_emb, query_emb):
+    query_proj = self.query_proj(query_emb).unsqueeze(1)
 
-class ScoreHeadTrainer():
-  def __init__(self, model, optimizer, margin):
+    attn_scores = torch.sum(neighbor_emb * query_proj, dim=-1)
+
+    attn_norm = F.softmax(attn_scores, dim=-1).unsqueeze(-1)
+
+    pooled_subgraph = torch.sum(neighbor_emb * attn_norm, dim=1)
+
+    query_proj_flat = query_proj.squeeze(1)
+
+    comb = torch.cat([pooled_subgraph, query_proj_flat], dim=1)
+    
+    return self.net(comb).squeeze(-1)
+
+class SubgraphTrainer():
+  def __init__(self, model, optimizer, margin=1.0):
     self.model = model
     self.optimizer = optimizer
 
@@ -86,24 +92,24 @@ class ScoreHeadTrainer():
     # Mostly ignore hard negatives at low epochs
     return 0.1 + (0.9 * (cur_epoch/total_epochs))
 
-  def train_step(self, data_loader, epoch_idx, total_epochs):
+  def train_epoch(self, data_loader, epoch_idx, total_epochs):
     self.model.train()
     
     alpha = self.get_hard_negative_weights(epoch_idx, total_epochs)
 
     running_loss = 0.0
 
-    for query_emb, pos_emb, hard_neg_emb, soft_neg_emb in data_loader:
-      query_emb = query_emb.to(self.device)
-      pos_emb = pos_emb.to(self.device)
-      hard_neg_emb = hard_neg_emb.to(self.device)
-      soft_neg_emb = soft_neg_emb.to(self.device)
+    for query, pos_neighbors, hard_neg_neighbors, soft_neg_neighbors in data_loader:
+      query = query.to(self.device)
+      pos_neighbors = pos_neighbors.to(self.device)
+      hard_neg_neighbors = hard_neg_neighbors.to(self.device)
+      soft_neg_neighbors = soft_neg_neighbors.to(self.device)
 
       self.optimizer.zero_grad()
 
-      pos_score = self.model(pos_emb, query_emb)
-      hard_neg_score = self.model(hard_neg_emb, query_emb)
-      soft_neg_score = self.model(soft_neg_emb, query_emb)
+      pos_score = self.model(pos_neighbors, query)
+      hard_neg_score = self.model(hard_neg_neighbors, query)
+      soft_neg_score = self.model(soft_neg_neighbors, query)
 
       target = torch.ones_like(pos_score).to(self.device)
       
