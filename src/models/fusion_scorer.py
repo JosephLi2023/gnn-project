@@ -27,10 +27,12 @@ class TripletSubgraphDataset(Dataset):
         return len(self.samples)
     def __getitem__(self, idx):
         query_id, movie_id = self.samples[idx]
+        # Comment: Will run the NN on the entire graph many times, making it very slow
         query_emb = self.encoder(self.data.x_dict, self.data.edge_index_dict)['conversation'][query_id]
         subgraph = extract_subgraph(self.data, [movie_id], query_emb, similarity_threshold=self.threshold, max_depth=self.max_depth)
         movie_embs = subgraph['movie'].x
         pooled_emb = self.pooling_fn(subgraph, node_type='movie', query_emb=query_emb)
+        # Comment: Comparing floats can fail dure to precision errors
         label = (movie_embs == self.data['movie'].x[movie_id]).all(dim=1).nonzero(as_tuple=True)[0].item()  # index of correct movie in subgraph
         return query_emb, pooled_emb, movie_embs, label
 
@@ -66,6 +68,7 @@ def train_fusion_scorer(scorer, dataloader, optimizer, epochs=10, margin=1.0, de
             label = label.to(device)
             subgraph_emb = subgraph_emb.to(device)
             pos_score = scorer(subgraph_emb, query_emb)
+            # Comment: "scores" is not defined
             loss = criterion(scores.unsqueeze(0), label.unsqueeze(0))
             optimizer.zero_grad()
             loss.backward()
@@ -109,6 +112,7 @@ def recommend_movies(query, encoder, scorer, data, faiss_index, movie_ids, top_k
         subgraphs.append(subgraph)
     if not subgraph_scores:
         return []
+    # Comment: Picking only one single subgraph might limit diversity and recall, what if rank the movies intead, a top-k
     best_idx = torch.tensor(subgraph_scores).argmax().item()
     best_subgraph = subgraphs[best_idx]
     best_movie_embs = best_subgraph['movie'].x
