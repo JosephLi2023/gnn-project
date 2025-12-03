@@ -10,9 +10,11 @@ def get_neighbors(data: HeteroData, movie_node_id: int, limit: int = 100) -> lis
        ('genre', 'has_movie', 'movie') in data.edge_index_dict:
         movie_to_genre = data['movie', 'has_genre', 'genre'].edge_index
         genre_to_movie = data['genre', 'has_movie', 'movie'].edge_index
+        # Comment: If movie_to_genre lives on the GPU, moving data from GPU to CPU can be slow
         genre_ids = movie_to_genre[1][movie_to_genre[0] == movie_node_id].tolist()
         for genre_id in genre_ids:
             movies = genre_to_movie[1][genre_to_movie[0] == genre_id].tolist()
+            # Comment: Only saves the movie id, no edges, we are left with floating nodes
             neighbor_sets['genre'].update(movies)
     # 2. User-based neighbors
     if ('movie', 'rated_by', 'user') in data.edge_index_dict and \
@@ -72,9 +74,11 @@ def extract_subgraph(data, candidate_movie_ids, query_emb, similarity_threshold=
                 continue
             if neighbor_id in range(movie_embs.shape[0]):
                 neighbor_emb = movie_embs[neighbor_id]
+                # Comment: Doing it one by one is slower than with pytorch matrix operation
                 sim = torch.dot(neighbor_emb, query_emb) / (neighbor_emb.norm() * query_emb.norm() + 1e-8)
                 if sim > similarity_threshold:
                     visited.add(neighbor_id)
                     queue.append((neighbor_id, depth + 1))
+    # Comment: PyG's subgraph() for hetero data expects a dictionary (ex: {"movie": [1,2], "user": [5]}
     subgraph = data.subgraph(list(visited))
     return subgraph
