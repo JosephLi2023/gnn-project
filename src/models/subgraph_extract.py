@@ -6,6 +6,8 @@ def get_neighbors(data, node_id):
     # Should return a list of neighbor node IDs for the given movie node
     raise NotImplementedError
 
+
+# add max number of nodes.
 def extract_subgraph(data, candidate_movie_ids, query_emb, similarity_threshold=0.6, max_depth=2):
     visited = set(candidate_movie_ids)
     queue = deque([(node_id, 0) for node_id in candidate_movie_ids])

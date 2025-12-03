@@ -16,23 +16,23 @@ pooled_emb_dim = 128  # Set according to your pooling output
 query_emb_dim = 384   # Set according to your encoder output
 
 class TripletSubgraphDataset(Dataset):
-    def __init__(self, triplets, encoder, data, pooling_fn, max_depth=2, threshold=0.6):
-        self.triplets = triplets
+    def __init__(self, samples, encoder, data, pooling_fn, max_depth=2, threshold=0.6):
+        self.samples = samples  # List of (query_id, movie_id)
         self.encoder = encoder
         self.data = data
         self.pooling_fn = pooling_fn
         self.max_depth = max_depth
         self.threshold = threshold
     def __len__(self):
-        return len(self.triplets)
+        return len(self.samples)
     def __getitem__(self, idx):
-        query_id, pos_movie_id, neg_movie_id = self.triplets[idx]
+        query_id, movie_id = self.samples[idx]
         query_emb = self.encoder(self.data.x_dict, self.data.edge_index_dict)['conversation'][query_id]
-        pos_subgraph = extract_subgraph(self.data, [pos_movie_id], query_emb, similarity_threshold=self.threshold, max_depth=self.max_depth)
-        pos_pool = self.pooling_fn(pos_subgraph, node_type='movie', query_emb=query_emb)
-        neg_subgraph = extract_subgraph(self.data, [neg_movie_id], query_emb, similarity_threshold=self.threshold, max_depth=self.max_depth)
-        neg_pool = self.pooling_fn(neg_subgraph, node_type='movie', query_emb=query_emb)
-        return query_emb, pos_pool, neg_pool
+        subgraph = extract_subgraph(self.data, [movie_id], query_emb, similarity_threshold=self.threshold, max_depth=self.max_depth)
+        movie_embs = subgraph['movie'].x
+        pooled_emb = self.pooling_fn(subgraph, node_type='movie', query_emb=query_emb)
+        label = (movie_embs == self.data['movie'].x[movie_id]).all(dim=1).nonzero(as_tuple=True)[0].item()  # index of correct movie in subgraph
+        return query_emb, pooled_emb, movie_embs, label
 
 class QuerySubgraphFusionScorer(nn.Module):
     def __init__(self, subgraph_dim, query_dim, fusion_dims=[512, 256, 128]):
@@ -58,15 +58,15 @@ class QuerySubgraphFusionScorer(nn.Module):
 
 def train_fusion_scorer(scorer, dataloader, optimizer, epochs=10, margin=1.0, device='cuda'):
     scorer.train()
+    criterion = nn.CrossEntropyLoss()
     for epoch in range(epochs):
         total_loss = 0
-        for query_emb, pos_subgraph_emb, neg_subgraph_emb in dataloader:
+        for query_emb, subgraph_emb, label in dataloader:
             query_emb = query_emb.to(device)
-            pos_subgraph_emb = pos_subgraph_emb.to(device)
-            neg_subgraph_emb = neg_subgraph_emb.to(device)
-            pos_score = scorer(pos_subgraph_emb, query_emb)
-            neg_score = scorer(neg_subgraph_emb, query_emb)
-            loss = -torch.nn.functional.logsigmoid(pos_score - neg_score - margin).mean()
+            label = label.to(device)
+            subgraph_emb = subgraph_emb.to(device)
+            pos_score = scorer(subgraph_emb, query_emb)
+            loss = criterion(scores.unsqueeze(0), label.unsqueeze(0))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
