@@ -160,7 +160,7 @@ class InferencePipeline():
     subgraph = next(iter(loader))
     return subgraph.to(self.device)
 
-  def extract_subgraph_nvidia(self, movie_idx, query_emb, depth=2, threshold=0.5):
+  def extract_subgraph_nvidia(self, movie_idx, query_emb, depth=2, threshold=0.5, max_neighbors=20):
     """
     Implements NVIDIA's Query-Guided Subgraph Expansion.
     Instead of random sampling, we only walk to neighbors that are semantically 
@@ -200,7 +200,17 @@ class InferencePipeline():
             sims = sims.unsqueeze(0)
           
           is_relevant = sims > threshold
-          relevant_indices = neighbor_indices[is_relevant]
+          valid_indices = neighbor_indices[is_relevant]
+          valid_sims = sims[is_relevant]
+
+          if len(valid_indices) == 0: continue
+
+          # Apply safety limit (Top-k) 
+          if len(valid_indices) > max_neighbors:
+              top_k_values, top_k_local_idx = torch.topk(valid_sims, k=max_neighbors)
+              relevant_indices = valid_indices[top_k_local_idx]
+          else:
+              relevant_indices = valid_indices
 
           for idx in relevant_indices.tolist():
             node_key = (dst_t, idx)
