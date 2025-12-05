@@ -14,13 +14,13 @@ import sentence_transformers
 def build_topk_with_label(
     logits: torch.Tensor,
     movie_ids: List[int],
-    label_id: int,
+    label_ids: List[int],
     k: int,
 ) -> Tuple[torch.Tensor, List[int]]:
     """
-    Ensure the label is present among the K items:
-      - take top-(k-1)
-      - add the label movie if it's not already there
+    Ensure all label movies are present among the K items:
+      - take top-(k-len(label_ids))
+      - add the label movies if they're not already there
     Returns:
       - selected_logits: [K] logits
       - selected_ids: List[int] length K
@@ -28,32 +28,21 @@ def build_topk_with_label(
     N = logits.size(0)
     if N == 0:
         return torch.empty(0, device=logits.device), []
-    # If label not in candidates, return empty to signal skip
-    try:
-        label_pos = movie_ids.index(label_id)
-    except ValueError:
-        return torch.empty(0, device=logits.device), []
-    # Get top-(k-1) indices
-    k_prime = max(1, min(k - 1, N))  # ensure at least 1 if k>=2
+    # Get top-(k-len(label_ids)) indices
+    k_prime = max(1, min(k - len(label_ids), N))
     top_idx = torch.topk(logits, k=k_prime, largest=True, sorted=True).indices.tolist()
-    if label_pos not in top_idx:
-        # Add label to reach K items
-        selected_idx = top_idx + [label_pos]
-    else:
-        # Label already in top-(k-1); can add next best to keep K items if desired
-        if len(top_idx) < k:
-            # Find next best not already in top_idx
-            all_sorted = torch.argsort(logits, descending=True).tolist()
-            for i in all_sorted:
-                if i not in top_idx:
-                    selected_idx = top_idx + [i]
-                    break
-            else:
-                selected_idx = top_idx  # fallback if N < k
-        else:
-            selected_idx = top_idx
-    # Gather logits and ids
-    selected_logits = logits[selected_idx]  # [K] (or <=K if not enough items)
+    # Add label movies to reach K items
+    label_indices = [movie_ids.index(lid) for lid in label_ids if lid in movie_ids and movie_ids.index(lid) not in top_idx]
+    selected_idx = top_idx + label_indices
+    # If not enough, fill up to k
+    if len(selected_idx) < k:
+        all_sorted = torch.argsort(logits, descending=True).tolist()
+        for i in all_sorted:
+            if i not in selected_idx:
+                selected_idx.append(i)
+            if len(selected_idx) == k:
+                break
+    selected_logits = logits[selected_idx]
     selected_ids = [movie_ids[i] for i in selected_idx]
     return selected_logits, selected_ids
 
@@ -77,30 +66,30 @@ def train(
         total_used = 0
         total_skipped = 0
         for step, batch in enumerate(dataloader, start=1):
-            # process per-sample due to variable-sized candidate dicts
             batch_loss = 0.0
             batch_count = 0
-            for query_emb, candidates_dict, label_id in batch:
-                # Skip if label not in the provided candidate set
-                if label_id not in candidates_dict:
+            for query_emb, candidates_dict, label_ids in batch:
+                # Skip if none of the labels are in the candidate set
+                if not any(lid in candidates_dict for lid in label_ids):
                     total_skipped += 1
                     continue
-                logits, movie_ids = model.forward(query_emb, candidates_dict)  # [N], List[int]
+                logits, movie_ids = model.forward(query_emb, candidates_dict)
                 if logits.numel() == 0:
                     total_skipped += 1
                     continue
-                # Build K-set including label
-                selected_logits, selected_ids = build_topk_with_label(logits, movie_ids, label_id, k=top_k)
+                selected_logits, selected_ids = build_topk_with_label(logits, movie_ids, label_ids, k=top_k)
                 if selected_logits.numel() == 0:
                     total_skipped += 1
                     continue
-                # Targets: binary vector over K items (1 at label position, else 0)
+                # Multi-hot targets
                 targets = torch.zeros(selected_logits.size(0), device=device)
-                try:
-                    label_k_pos = selected_ids.index(label_id)
-                    targets[label_k_pos] = 1.0
-                except ValueError:
-                    # Should not happen due to build_topk_with_label; skip defensively
+                for lid in label_ids:
+                    try:
+                        label_k_pos = selected_ids.index(lid)
+                        targets[label_k_pos] = 1.0
+                    except ValueError:
+                        continue  # label not in selected_ids
+                if targets.sum() == 0:
                     total_skipped += 1
                     continue
                 loss = bce(selected_logits, targets)
