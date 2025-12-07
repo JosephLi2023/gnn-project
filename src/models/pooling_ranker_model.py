@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple
 from pooling_with_projection import QueryGuidedPoolingWithProjection
+from subgraph import Subgraph
 
 class QueryFusionScorer(nn.Module):
     """
@@ -53,32 +54,22 @@ class PoolingMovieRanker(nn.Module):
         self.scorer = QueryFusionScorer(item_dim=deep_emb_dim, query_dim=query_emb_dim, fusion_dims=fusion_dims)
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
+        
     def forward(
         self,
-        query_emb: torch.Tensor,
-        subgraphs: List[Dict],  # Each dict: {"graph_id": int, "embeddings": List[torch.Tensor]}
+        query_emb: torch.Tensor,                # shape: [D_q]
+        subgraphs: List[Subgraph]               # list of Subgraph objects
     ) -> Tuple[torch.Tensor, List[int]]:
         """
-        query_emb: [D_q]
-        subgraphs: List of {"graph_id": int, "embeddings": List[torch.Tensor[D_deep]]}
-        returns:
-           - logits: [N] tensor
-           - graph_ids: List[int] of length N
+        Args:
+            query_emb: [D_q] tensor
+            subgraphs: List of Subgraph objects
+        Returns:
+            logits: [num_subgraphs] tensor (score for each subgraph)
+            graph_ids: List[int] (subgraph root ids)
         """
-        graph_ids = []
-        pooled_embs = []
-        for subgraph in subgraphs:
-            graph_id = subgraph["graph_id"]
-            emb_list = subgraph["embeddings"]
-            if len(emb_list) == 0:
-                continue
-            graph_embs = torch.stack(emb_list, dim=0).to(self.device).float()  # [num_embs, D_deep]
-            pooled_emb = self.pooling(graph_embs, query_emb)  # [D_deep]
-            pooled_embs.append(pooled_emb)
-            graph_ids.append(graph_id)
-        if len(pooled_embs) == 0:
-            return torch.empty(0, device=self.device), []
-        item_embs = torch.stack(pooled_embs, dim=0)  # [N, D_deep]
-        query_emb = query_emb.to(self.device).float()
-        logits = self.scorer(item_embs, query_emb)  # [N]
+        pooled_embs = [self.pooling(torch.stack(sg.embeddings, dim=0), query_emb) for sg in subgraphs]
+        item_embs = torch.stack(pooled_embs, dim=0)
+        logits = self.scorer(item_embs, query_emb)
+        graph_ids = [sg.graph_id for sg in subgraphs]
         return logits, graph_ids

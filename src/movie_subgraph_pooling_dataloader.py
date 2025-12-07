@@ -4,12 +4,7 @@ import pandas as pd
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import ast
-
-class Subgraph:
-    def __init__(self, graph_id, movie_ids, embeddings):
-        self.graph_id = graph_id
-        self.movie_ids = movie_ids
-        self.embeddings = embeddings  # List[torch.Tensor] or torch.Tensor
+from models.subgraph import Subgraph
 
 class MovieSubgraphPoolingRecommendationDataset(Dataset):
     def __init__(
@@ -108,15 +103,15 @@ def custom_collate_fn(batch):
     Custom collate to handle variable candidate subgraph lists.
     Each batch item:
       - 'query_emb': Tensor
-      - 'candidates': List[Dict] (subgraphs)
+      - 'candidates': List[Subgraph] (subgraphs)
       - 'positive_movie_ids': List[int]
     Returns:
       - 'query_emb': Tensor [batch_size, emb_dim]
-      - 'candidates': List[List[Dict]] (batch_size lists of subgraphs)
+      - 'candidates': List[List[Subgraph]] (batch_size lists of subgraphs)
       - 'positive_movie_ids': List[List[int]] (batch_size lists)
     """
     return {
         'query_emb': torch.stack([item['query_emb'] for item in batch]),
-        'candidates': [item['candidates'] for item in batch],  # List[List[Dict]]
+        'candidates': [item['candidates'] for item in batch],  # List[List[Subgraph]]
         'positive_movie_ids': [item['positive_movie_ids'] for item in batch]
     }
