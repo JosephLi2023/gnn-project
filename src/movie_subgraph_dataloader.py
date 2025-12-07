@@ -62,7 +62,8 @@ class MovieSubgraphRecommendationDataset(Dataset):
                 replace_idx = random.randint(0, len(candidate_movie_ids) - 1)
                 candidate_movie_ids[replace_idx] = pid
         # 3. For each candidate, get up to 20 neighbors from the graph
-        expanded_movie_ids = set(candidate_movie_ids)
+        expanded_movie_ids = extract_movie_subgraph(self.graph_data, candidate_movie_ids, self.num_neighbors_per_candidate)
+        
         for cid in candidate_movie_ids:
             neighbors = get_neighbors(self.graph_data, cid, limit=self.num_neighbors_per_candidate)
             expanded_movie_ids.update(neighbors)

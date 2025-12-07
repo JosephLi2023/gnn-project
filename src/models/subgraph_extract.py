@@ -1,6 +1,7 @@
 import torch
 from collections import deque
 from torch_geometric.data import HeteroData
+import random
 
 def get_neighbors(data: HeteroData, movie_node_id: int, limit: int = 100) -> list:
     quota = limit // 3
